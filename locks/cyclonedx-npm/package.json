@@ -1,0 +1,9 @@
+{
+  "name": "valystrum-cyclonedx-npm",
+  "private": true,
+  "description": "The CycloneDX npm generator the Valystrum SBOM integrations run, every package locked by version and hash.",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@cyclonedx/cyclonedx-npm": "6.0.1"
+  }
+}

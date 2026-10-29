@@ -1,0 +1,222 @@
+name: "Valystrum SBOM"
+description: "Generate a CycloneDX SBOM with the official CycloneDX tooling and ingest it into Valystrum."
+author: "Valystrum"
+
+branding:
+  icon: package
+  color: blue
+
+inputs:
+  ingest-url:
+    description: "Valystrum SBOM ingest URL, e.g. https://app.valystrum.io/api/v1/<org>/sbom/ingest"
+    required: true
+  ingest-secret:
+    description: "Repository CI secret (cs_wh_…) from POST /api/v1/<org>/pipeline/config, issued for the repository named by source. The same secret the pipeline action uses. Store it as a repository secret."
+    required: true
+  path:
+    description: "Directory to scan for manifests."
+    default: "."
+  ecosystem:
+    description: "'auto' to detect from manifests, or a space-separated subset of: npm python go maven"
+    default: "auto"
+  source:
+    description: "Label the components are grouped under in the Valystrum SBOM inventory. Defaults to the repository name."
+    default: ""
+  asset:
+    description: "Name (or hostname) of the Valystrum Asset these components belong to. Links the SBOM to that asset and its service. Falls back to an exact match on the source label; components that match nothing stay unlinked."
+    default: ""
+  complete:
+    description: "'true' when this step's SBOM is the whole of the source: the source's components it no longer lists are removed in Valystrum, and their CVE and licence findings resolve. Leave it 'false' when several steps or workflows upload parts of one source (a monorepo's modules), or each upload would remove the others' components."
+    default: "false"
+
+outputs:
+  sbom-path:
+    description: "Path to the CycloneDX JSON document that was uploaded."
+    value: ${{ steps.generate.outputs.sbom-path }}
+  components:
+    description: "Number of components Valystrum ingested."
+    value: ${{ steps.upload.outputs.components }}
+  removed:
+    description: "Number of the source's components Valystrum removed because the SBOM no longer lists them (0 unless complete is 'true')."
+    value: ${{ steps.upload.outputs.removed }}
+
+runs:
+  using: composite
+  steps:
+    - id: generate
+      name: Generate CycloneDX SBOM
+      shell: bash
+      env:
+        SCAN_PATH: ${{ inputs.path }}
+        ECOSYSTEM: ${{ inputs.ecosystem }}
+        LOCKS: ${{ github.action_path }}/locks
+      run: |
+        set -euo pipefail
+        cd "$SCAN_PATH"
+
+        OUT_DIR="$RUNNER_TEMP/valystrum-sbom"
+        rm -rf "$OUT_DIR" && mkdir -p "$OUT_DIR"
+        TOOLS="$RUNNER_TEMP/valystrum-sbom-tools"
+        rm -rf "$TOOLS" && mkdir -p "$TOOLS"
+
+        # Each generator at its newest release as of 2026-10-28, and everything it installs locked: the npm and Python
+        # generators' whole trees from the lock files in this action's locks/ (each package by its hash), the Go
+        # module's from its own go.sum through sum.golang.org, the Maven plugin's by its version and the repository's
+        # checksums. Valystrum's GitLab, Azure Pipelines, AWS CodeBuild and Google Cloud Build integrations run the
+        # same pins and locks.
+        CDX_NPM_VERSION="6.0.1"
+        CDX_PY_VERSION="7.6.0"
+        CDX_GOMOD_VERSION="1.12.0"
+        CDX_MAVEN_VERSION="2.9.3"
+
+        # 'auto' runs every generator whose manifest is present; otherwise only
+        # the ecosystems named in the input.
+        want() {
+          [ "$ECOSYSTEM" = "auto" ] && return 0
+          case " $ECOSYSTEM " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+        }
+
+        if want npm && [ -f package-lock.json ]; then
+          echo "::group::CycloneDX: npm (@cyclonedx/cyclonedx-npm $CDX_NPM_VERSION)"
+          # From its lock file: every package at its locked version and SHA-512, nothing resolved, fetched through the
+          # project's own npm registry (a mirror included).
+          mkdir -p "$TOOLS/npm" && cp "$LOCKS/cyclonedx-npm/package.json" "$LOCKS/cyclonedx-npm/package-lock.json" "$TOOLS/npm/"
+          REGISTRY="$(npm config get registry)"
+          (cd "$TOOLS/npm" && npm ci --silent --ignore-scripts --no-audit --no-fund --registry "$REGISTRY")
+          # cyclonedx-npm walks the INSTALLED tree, not just the lockfile:
+          # the workflow must run `npm ci` before this action.
+          # --ignore-npm-errors: `npm ls` exits non-zero on extraneous/invalid
+          # packages (optional native deps, peer mismatches). Those are still
+          # real installed components, so report them instead of failing.
+          "$TOOLS/npm/node_modules/.bin/cyclonedx-npm" \
+            --ignore-npm-errors \
+            --output-format JSON --output-file "$OUT_DIR/npm.cdx.json"
+          echo "::endgroup::"
+        fi
+
+        if want python; then
+          PY_SUBCOMMAND=""
+          PY_TARGET="."
+          if   [ -f poetry.lock ];      then PY_SUBCOMMAND="poetry"
+          elif [ -f Pipfile.lock ];     then PY_SUBCOMMAND="pipenv"
+          elif [ -f requirements.txt ]; then PY_SUBCOMMAND="requirements"; PY_TARGET="requirements.txt"
+          fi
+          if [ -n "$PY_SUBCOMMAND" ]; then
+            echo "::group::CycloneDX: python ($PY_SUBCOMMAND, cyclonedx-bom $CDX_PY_VERSION)"
+            python3 -m venv "$TOOLS/py"
+            # From its lock file: every package's wheel checked against its locked SHA-256, nothing resolved.
+            "$TOOLS/py/bin/pip" install --quiet --disable-pip-version-check --require-hashes --no-deps --only-binary=:all: -r "$LOCKS/cyclonedx-py/requirements.txt"
+            "$TOOLS/py/bin/cyclonedx-py" "$PY_SUBCOMMAND" \
+              --output-format JSON --output-file "$OUT_DIR/python.cdx.json" "$PY_TARGET"
+            echo "::endgroup::"
+          fi
+        fi
+
+        if want go && [ -f go.mod ]; then
+          echo "::group::CycloneDX: go (cyclonedx-gomod $CDX_GOMOD_VERSION)"
+          go run "github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v$CDX_GOMOD_VERSION" \
+            mod -json -output "$OUT_DIR/go.cdx.json" .
+          echo "::endgroup::"
+        fi
+
+        if want maven && [ -f pom.xml ]; then
+          echo "::group::CycloneDX: maven (cyclonedx-maven-plugin $CDX_MAVEN_VERSION)"
+          mvn -B -q --strict-checksums "org.cyclonedx:cyclonedx-maven-plugin:$CDX_MAVEN_VERSION:makeAggregateBom" \
+            -DoutputFormat=json -DoutputName=bom
+          cp target/bom.json "$OUT_DIR/maven.cdx.json"
+          echo "::endgroup::"
+        fi
+
+        shopt -s nullglob
+        BOMS=("$OUT_DIR"/*.cdx.json)
+        if [ "${#BOMS[@]}" -eq 0 ]; then
+          echo "::error::No supported manifest found under '$SCAN_PATH'. Supported: package-lock.json (npm), requirements.txt / poetry.lock / Pipfile.lock (python), go.mod (go), pom.xml (maven)."
+          exit 1
+        fi
+
+        if [ "${#BOMS[@]}" -eq 1 ]; then
+          SBOM="${BOMS[0]}"
+        else
+          # ponytail: multi-ecosystem repos get a components-only merge (dedup by
+          # purl) rather than a full cyclonedx-cli merge: the ingest endpoint reads
+          # name/version/purl/licenses and nothing else. Swap in `cyclonedx merge`
+          # if the full document (dependency graph, per-tool metadata) is ever needed.
+          SBOM="$OUT_DIR/merged.cdx.json"
+          jq -s '{
+            bomFormat: "CycloneDX",
+            specVersion: (.[0].specVersion // "1.5"),
+            version: 1,
+            components: (map(.components // []) | add
+                         | unique_by(.purl // (.name + "@" + .version)))
+          }' "${BOMS[@]}" > "$SBOM"
+        fi
+
+        COUNT=$(jq '(.components // []) | length' "$SBOM")
+        echo "CycloneDX $(jq -r '.specVersion // "?"' "$SBOM"): $COUNT components from ${#BOMS[@]} generator(s)."
+        echo "sbom-path=$SBOM"        >> "$GITHUB_OUTPUT"
+        echo "component-count=$COUNT" >> "$GITHUB_OUTPUT"
+
+    - id: upload
+      name: Ingest into Valystrum
+      shell: bash
+      env:
+        SBOM: ${{ steps.generate.outputs.sbom-path }}
+        COUNT: ${{ steps.generate.outputs.component-count }}
+        INGEST_URL: ${{ inputs.ingest-url }}
+        INGEST_SECRET: ${{ inputs.ingest-secret }}
+        SOURCE_INPUT: ${{ inputs.source }}
+        ASSET_INPUT: ${{ inputs.asset }}
+        COMPLETE_INPUT: ${{ inputs.complete }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "$INGEST_SECRET" ]; then
+          echo "::error::ingest-secret is empty. Check the repository secret name in your workflow."
+          exit 1
+        fi
+        if [ "$COUNT" -eq 0 ]; then
+          echo "::error::The generated SBOM has 0 components: nothing to ingest. Ensure dependencies are installed (e.g. 'npm ci') before this action."
+          exit 1
+        fi
+
+        SOURCE="${SOURCE_INPUT:-}"
+        [ -z "$SOURCE" ] && SOURCE="$GITHUB_REPOSITORY"
+
+        PAYLOAD="$RUNNER_TEMP/valystrum-sbom-payload.json"
+        RESPONSE="$RUNNER_TEMP/valystrum-sbom-response.json"
+        jq -c --arg source "$SOURCE" --arg asset "$ASSET_INPUT" --arg complete "$COMPLETE_INPUT"           '{source: $source, sbom: .} + (if $asset == "" then {} else {assetRef: $asset} end) + (if $complete == "true" then {complete: true} else {} end)'           "$SBOM" > "$PAYLOAD"
+
+        # Stamped HMAC-SHA256: the digest covers "<unix seconds>.<body>",
+        # over the exact bytes curl sends (--data-binary is verbatim). The platform
+        # accepts a stamp within five minutes and once, so every attempt signs
+        # afresh: a resent signature is refused as already used. The pause between
+        # attempts is at least a second, so each attempt carries a new stamp.
+        # Retries are safe: ingest upserts on (org, name, version, source), and a
+        # complete bill sent twice removes nothing the first did not.
+        for ATTEMPT in 1 2 3 4; do
+          : > "$RESPONSE"  # curl leaves -o untouched when nothing answers: no earlier attempt's body in the error
+          T=$(date +%s)
+          SIGNATURE=$( { printf '%s.' "$T"; cat "$PAYLOAD"; } | openssl dgst -sha256 -hmac "$INGEST_SECRET" | awk '{print $NF}')
+          CODE=$(curl -sS \
+            -o "$RESPONSE" -w '%{http_code}' \
+            -X POST "$INGEST_URL" \
+            -H 'content-type: application/json' \
+            -H "x-cs-signature: t=$T,v1=$SIGNATURE" \
+            --data-binary @"$PAYLOAD") || CODE="000"
+          # Retried as curl's own retry did: no answer, 408, 429 and 5xx.
+          case "$CODE" in 000|408|429|5??) ;; *) break ;; esac
+          if [ "$ATTEMPT" -lt 4 ]; then sleep $((1 << (ATTEMPT - 1))); fi
+        done
+
+        if [ "$CODE" != "201" ] && [ "$CODE" != "200" ]; then
+          echo "::error::Valystrum ingest failed (HTTP $CODE): $(head -c 500 "$RESPONSE" 2>/dev/null)"
+          exit 1
+        fi
+
+        INGESTED=$(jq -r '.data.ingested // 0' "$RESPONSE")
+        REMOVED=$(jq -r '.data.removed // 0' "$RESPONSE")
+        echo "components=$INGESTED" >> "$GITHUB_OUTPUT"
+        echo "removed=$REMOVED" >> "$GITHUB_OUTPUT"
+        echo "Ingested $INGESTED components into Valystrum as source '$SOURCE'; removed $REMOVED it no longer lists."
+        echo "### Valystrum SBOM" >> "$GITHUB_STEP_SUMMARY"
+        echo "Ingested **$INGESTED** components as source \`$SOURCE\`; removed **$REMOVED** the SBOM no longer lists." >> "$GITHUB_STEP_SUMMARY"

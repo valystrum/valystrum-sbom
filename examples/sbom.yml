@@ -1,0 +1,40 @@
+# Copy to .github/workflows/sbom.yml in your repository.
+name: sbom
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"   # refresh the inventory weekly, so it stays true between releases
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Keep uploads in order, so an older run that finishes late cannot put an older set back.
+concurrency:
+  group: "sbom-${{ github.repository }}"
+  cancel-in-progress: false
+
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The CycloneDX generators walk the INSTALLED dependency tree, not the
+      # lockfile alone. Install first, or the SBOM comes out empty.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26.13.0"   # your project's Node version
+          cache: npm
+      - run: npm ci
+
+      - uses: valystrum/valystrum-sbom@v1
+        with:
+          ingest-url: https://app.valystrum.io/api/v1/acme/sbom/ingest
+          ingest-secret: ${{ secrets.CS_WEBHOOK_SECRET }}
+          # This one step uploads the whole repository: what it no longer lists is removed and its findings resolve.
+          # Only from the default branch: a run started by hand on another branch only adds.
+          # Leave it out if other steps upload parts of the same source (a monorepo's modules).
+          complete: ${{ github.ref == 'refs/heads/main' }}
